@@ -1,0 +1,272 @@
+package server
+
+// batch_campaign.go — 批量资产渗透（集成到任务模块）：
+//   在任务页新建任务抽屉里切「批量模式」→ 多 URL → 每目标创建标准任务
+//
+//   POST /api/batch/create          创建批量（多目标→指纹→任务，任务出现在标准任务列表）
+//   GET  /api/batch/{id}            战役详情（任务进度+发现汇总）
+
+import (
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/Autumn-27/artex/db"
+)
+
+// ensureBatchTables 幂等建表。
+func (s *Server) ensureBatchTables() {
+	_, _ = s.m.PG().Exec(`CREATE TABLE IF NOT EXISTS batch_campaigns (
+		id BIGSERIAL PRIMARY KEY,
+		name TEXT NOT NULL DEFAULT '',
+		goal_template TEXT NOT NULL DEFAULT '',
+		targets JSONB NOT NULL DEFAULT '[]',
+		status TEXT NOT NULL DEFAULT 'pending',
+		created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+		updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+	)`)
+}
+
+// BatchTarget 批量目标。
+type BatchTarget struct {
+	URL         string `json:"url"`
+	Fingerprint string `json:"fingerprint,omitempty"`
+	TaskID      *int64 `json:"task_id,omitempty"`
+	Status      string `json:"status"`
+}
+
+// POST /api/batch/create — 批量创建任务（每目标一个标准任务，出现在任务列表）。
+func (s *Server) batchCreate(w http.ResponseWriter, r *http.Request) {
+	s.ensureBatchTables()
+	var b struct {
+		Name         string   `json:"name"`
+		Targets      []string `json:"targets"`
+		GoalTemplate string   `json:"goal_template"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&b); err != nil {
+		writeErr(w, 400, "bad json: "+err.Error())
+		return
+	}
+	if len(b.Targets) == 0 {
+		writeErr(w, 400, "targets 不能为空")
+		return
+	}
+	if len(b.Targets) > 100 {
+		writeErr(w, 400, "单次最多 100 个目标")
+		return
+	}
+	if b.Name == "" {
+		b.Name = fmt.Sprintf("批量 %s（%d 目标）", time.Now().Format("01-02 15:04"), len(b.Targets))
+	}
+	if b.GoalTemplate == "" {
+		b.GoalTemplate = `对目标 {URL} 进行渗透测试，尽可能多地发现高危漏洞。
+指纹：{FINGERPRINT}
+优先检查未授权访问/默认凭据/已知漏洞。发现的漏洞用 report_finding 提交。`
+	}
+
+	// 并发指纹识别
+	type fpResult struct{ idx int; fp string }
+	ch := make(chan fpResult, len(b.Targets))
+	sem := make(chan struct{}, 10)
+	targets := make([]BatchTarget, 0, len(b.Targets))
+	for _, u := range b.Targets {
+		u = strings.TrimSpace(u)
+		if u != "" {
+			targets = append(targets, BatchTarget{URL: u, Status: "pending"})
+		}
+	}
+	for i, t := range targets {
+		go func(i int, url string) {
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			fp, err := s.doFingerprint(r.Context(), url)
+			tag := ""
+			if err == nil && fp != nil {
+				tag = fp.Fingerprint
+				// 指纹三路入库（与 /api/tools/fingerprint 一致）：
+				// assets 资产 + dict(fingerprint) 字典 + KB 经验
+				_, _ = s.m.PG().Exec(`INSERT INTO assets (type, value, source, metadata)
+					VALUES ('service', $1, 'fingerprint', $2) ON CONFLICT DO NOTHING`, url, fp.Fingerprint)
+				s.fingerprintToDict(fp)
+			}
+			ch <- fpResult{idx: i, fp: tag}
+		}(i, t.URL)
+	}
+	for range targets {
+		res := <-ch
+		targets[res.idx].Fingerprint = res.fp
+	}
+
+	// 创建任务：必须走 Manager.CreateTaskWithOptions + launchTask（与任务页新建完全一致），
+	// 直接 SQL INSERT 只落库不进内存注册表，引擎不会执行（tokens=0、findings=0 的根因）。
+	created := 0
+	for i := range targets {
+		goal := strings.ReplaceAll(b.GoalTemplate, "{URL}", targets[i].URL)
+		goal = strings.ReplaceAll(goal, "{FINGERPRINT}", targets[i].Fingerprint)
+		taskName := fmt.Sprintf("%s [%d/%d]", b.Name, i+1, len(targets))
+
+		t, err := s.m.CreateTaskWithOptions(targets[i].URL, goal, db.TaskCreateOptions{
+			Name: taskName,
+		})
+		if err != nil {
+			log.Printf("[batch] 任务创建失败 %s: %v", targets[i].URL, err)
+			continue
+		}
+		// seed + 后台目标分解 + engine.Run，与 server.go createTask 相同的建后流程。
+		// admitTask 自带并发槽位控制，超出并发的任务自动排队。
+		s.launchTask(t, targets[i].URL+" "+goal, false)
+
+		taskID, _ := strconv.ParseInt(t.ID, 10, 64)
+		targets[i].TaskID = &taskID
+		targets[i].Status = "created"
+		created++
+	}
+
+	// 存战役
+	targetsJSON, _ := json.Marshal(targets)
+	var campaignID int64
+	_ = s.m.PG().QueryRow(
+		`INSERT INTO batch_campaigns (name, goal_template, targets, status)
+		VALUES ($1, $2, $3, 'created') RETURNING id`,
+		b.Name, b.GoalTemplate, string(targetsJSON)).Scan(&campaignID)
+
+	s.c2AuditHashed("", "", "batch_create", fmt.Sprintf("campaign:%d targets:%d created:%d", campaignID, len(targets), created))
+
+	writeJSON(w, 200, map[string]any{"data": map[string]any{
+		"campaign_id": campaignID, "name": b.Name, "targets": targets,
+		"created": created,
+		"message": fmt.Sprintf("✅ 已创建 %d 个任务（共 %d 个目标）", created, len(targets)),
+	}})
+}
+
+// GET /api/batch — 战役列表（任务页「按战役筛选」数据源）。
+// 每战役带 task_ids 与各任务状态计数；上限 100 条（够筛选用）。
+func (s *Server) batchList(w http.ResponseWriter, r *http.Request) {
+	s.ensureBatchTables()
+	rows, err := s.m.PG().Query(
+		`SELECT id, name, targets, status, created_at FROM batch_campaigns ORDER BY id DESC LIMIT 100`)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	defer rows.Close()
+	type campaign struct {
+		ID        int64    `json:"id"`
+		Name      string   `json:"name"`
+		TaskIDs   []int64  `json:"task_ids"`
+		Total     int      `json:"total"`
+		Done      int      `json:"done"`
+		Findings  int      `json:"findings"`
+		CreatedAt string   `json:"created_at"`
+	}
+	out := []campaign{}
+	for rows.Next() {
+		var cp campaign
+		var targetsJSON []byte
+		var campStatus string
+		var ts time.Time
+		if err := rows.Scan(&cp.ID, &cp.Name, &targetsJSON, &campStatus, &ts); err != nil {
+			continue
+		}
+		// targets JSONB 里的 status 字段与列重名，先解析拿 task_ids
+		var targets []BatchTarget
+		_ = json.Unmarshal(targetsJSON, &targets)
+		cp.TaskIDs = []int64{}
+		ids := []int64{}
+		done := 0
+		for _, t := range targets {
+			if t.TaskID != nil {
+				cp.TaskIDs = append(cp.TaskIDs, *t.TaskID)
+				ids = append(ids, *t.TaskID)
+				if t.Status == "done" {
+					done++
+				}
+			}
+		}
+		cp.Total = len(cp.TaskIDs)
+		// 实时状态以 tasks 表为准（targets JSON 里的 status 是创建时快照）
+		if len(ids) > 0 {
+			rows2, err := s.m.PG().Query(
+				`SELECT t.id, COALESCE(t.status,''), COUNT(f.id)
+				 FROM tasks t LEFT JOIN findings f ON f.task_id = t.id
+				 WHERE t.id = ANY($1::bigint[]) GROUP BY t.id, t.status`, ids)
+			if err == nil {
+				done = 0
+				for rows2.Next() {
+					var id int64
+					var st string
+					var fc int
+					if err := rows2.Scan(&id, &st, &fc); err == nil {
+						if st == "done" {
+							done++
+						}
+						for i := range targets {
+							if targets[i].TaskID != nil && *targets[i].TaskID == id {
+								cp.Findings += fc
+							}
+						}
+					}
+				}
+				rows2.Close()
+			}
+		}
+		cp.Done = done
+		cp.CreatedAt = ts.Format("01-02 15:04")
+		out = append(out, cp)
+	}
+	writeJSON(w, 200, map[string]any{"data": out})
+}
+
+// GET /api/batch/{id} — 战役详情。
+func (s *Server) batchDetail(w http.ResponseWriter, r *http.Request) {
+	s.ensureBatchTables()
+	id := parseID(r.PathValue("id"))
+	if id <= 0 {
+		writeErr(w, 400, "bad id")
+		return
+	}
+	var name, status string
+	var targetsJSON []byte
+	var ts sql.NullTime
+	if err := s.m.PG().QueryRow(
+		`SELECT name, targets, status, created_at FROM batch_campaigns WHERE id=$1`, id).
+		Scan(&name, &targetsJSON, &status, &ts); err != nil {
+		writeErr(w, 404, "战役不存在")
+		return
+	}
+	var targets []BatchTarget
+	_ = json.Unmarshal(targetsJSON, &targets)
+
+	// 任务状态和发现
+	totalFind, totalCrit, done := 0, 0, 0
+	for i := range targets {
+		if targets[i].TaskID == nil {
+			continue
+		}
+		var taskStatus string
+		var fc, cc int
+		_ = s.m.PG().QueryRow(`SELECT status FROM tasks WHERE id=$1`, *targets[i].TaskID).Scan(&taskStatus)
+		_ = s.m.PG().QueryRow(`SELECT COUNT(*), COALESCE(SUM(CASE WHEN severity='critical' THEN 1 ELSE 0 END),0)
+			FROM findings WHERE task_id=$1`, *targets[i].TaskID).Scan(&fc, &cc)
+		targets[i].Status = taskStatus
+		totalFind += fc
+		totalCrit += cc
+		if taskStatus == "done" {
+			done++
+		}
+	}
+
+	createdAt := ""
+	if ts.Valid {
+		createdAt = ts.Time.Format("2006-01-02 15:04")
+	}
+	writeJSON(w, 200, map[string]any{"data": map[string]any{
+		"id": id, "name": name, "status": status, "targets": targets, "created_at": createdAt,
+		"summary": map[string]any{"total": len(targets), "done": done, "findings": totalFind, "critical": totalCrit},
+	}})
+}

